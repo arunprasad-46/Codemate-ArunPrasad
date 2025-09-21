@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+PyGithub
+python-gitlab
+pylint
+requests
+anyio
