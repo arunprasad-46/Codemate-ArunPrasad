@@ -10,3 +10,4 @@ astroid
 aiohttp
 pyjwt[crypto]
 python-dotenv
+PyGithub
