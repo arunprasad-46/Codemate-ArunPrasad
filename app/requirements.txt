@@ -1,12 +1,7 @@
 fastapi
-pydantic
 uvicorn
-requests
-click
+PyGithub
+python-gitlab
 pylint
-radon
-bandit
-astroid
-aiohttp
-pyjwt[crypto]
-python-dotenv
+requests
+anyio

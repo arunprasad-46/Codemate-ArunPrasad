@@ -1,0 +1,12 @@
+fastapi
+pydantic
+uvicorn
+requests
+click
+pylint
+radon
+bandit
+astroid
+aiohttp
+pyjwt[crypto]
+python-dotenv
