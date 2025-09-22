@@ -1,6 +1,8 @@
 fastapi
 pydantic
 uvicorn
+uvicorn[standard]
+gunicorn
 requests
 click
 pylint

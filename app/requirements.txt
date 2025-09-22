@@ -4,4 +4,6 @@ PyGithub
 python-gitlab
 pylint
 requests
+uvicorn[standard]
+gunicorn
 anyio
