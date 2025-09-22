@@ -7,22 +7,11 @@ class GitLabClient(GitClient):
     GitLab-specific implementation of GitClient
     """
     def __init__(self, token: str, gitlab_url: str = "https://gitlab.com"):
-        # Ensure the URL is properly formatted
-        gitlab_url = gitlab_url.rstrip('/')
-        api_url = f"{gitlab_url}/api/v4"
-        super().__init__(token, api_url=api_url)
+        super().__init__(token, api_url=f"{gitlab_url}/api/v4")
 
     def get_auth_headers(self) -> Dict[str, str]:
-        # For OAuth access tokens, remove the prefix before using it
-        token = self.token
-        if token.startswith('gloas-'):
-            token = token[6:]  # Remove 'gloas-' prefix
-        elif token.startswith('glpat-'):
-            token = token[6:]  # Remove 'glpat-' prefix
-
         return {
-            "Authorization": f"Bearer {token}",
-            "Accept": "application/json"
+            "PRIVATE-TOKEN": self.token
         }
 
     async def get_repositories(self) -> List[Dict]:

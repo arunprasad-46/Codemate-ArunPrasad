@@ -5,9 +5,6 @@ from typing import Dict, List, Optional
 import logging
 import os
 from .github_review import get_installation_token, post_review_comments
-from .git.base import GitClient
-from .git.factory import GitClientFactory
-from .git.factory import GitClientFactory
 from .analyzer import CodeAnalyzer
 from .feedback import FeedbackGenerator
 from .ai_feedback import AIFeedbackGenerator
@@ -15,7 +12,7 @@ from .auth.github_auth import get_device_code, get_access_token
 import asyncio
 import threading
 import time
-import asyncio
+from github import Github
 
 app = FastAPI(title="PR Review Agent API")
 
@@ -45,6 +42,54 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# -------------------- Git Client Functions --------------------
+class GitHubClient:
+    """GitHub client for handling repository operations"""
+    
+    def __init__(self, access_token: str):
+        self.client = Github(access_token)
+    
+    async def get_repositories(self):
+        """Get all repositories for the authenticated user"""
+        try:
+            repos = self.client.get_user().get_repos()
+            return list(repos)
+        except Exception as e:
+            logger.error(f"Error fetching repositories: {str(e)}")
+            raise Exception(f"Failed to fetch repositories: {str(e)}")
+    
+    async def get_pull_requests(self, repo_name: str):
+        """Get all pull requests for a repository"""
+        try:
+            repo = self.client.get_repo(repo_name)
+            prs = repo.get_pulls(state='all', sort='created', direction='desc')
+            return list(prs)
+        except Exception as e:
+            logger.error(f"Error fetching PRs for {repo_name}: {str(e)}")
+            raise Exception(f"Failed to fetch pull requests: {str(e)}")
+    
+    async def get_pr_files(self, repo_name: str, pr_number: int):
+        """Get all files and their content from a pull request"""
+        try:
+            repo = self.client.get_repo(repo_name)
+            pr = repo.get_pull(pr_number)
+            files_content = {}
+            
+            for file in pr.get_files():
+                if file.status != 'removed':  # Skip deleted files
+                    try:
+                        # Get file content
+                        content = repo.get_contents(file.filename, ref=pr.head.sha)
+                        files_content[file.filename] = content.decoded_content.decode('utf-8')
+                    except Exception as e:
+                        logger.error(f"Error fetching content for {file.filename}: {str(e)}")
+                        files_content[file.filename] = ""
+            
+            return files_content
+        except Exception as e:
+            logger.error(f"Error fetching PR files: {str(e)}")
+            raise Exception(f"Error fetching PR files: {str(e)}")
 
 # -------------------- Helper Functions --------------------
 def calculate_pr_score(analysis_results: List[Dict]) -> Dict:
@@ -132,11 +177,13 @@ class LoginRequest(BaseModel):
     scopes: Optional[List[str]] = None  # Optional scopes for authorization
 
 class RepoRequest(BaseModel):
-    repo_name: str = None  # Optional, if you want to fetch PRs immediately
+    repo_name: Optional[str] = None  # Optional, if you want to fetch PRs immediately
+    client_id: str  # Add client_id to the request body
 
 class PRRequest(BaseModel):
     repo_name: str
     pr_number: int
+    client_id: str  # Add client_id to the request body
     context: Optional[Dict] = None  # Additional context for the review
 
 class FileReviewRequest(BaseModel):
@@ -193,8 +240,7 @@ async def fetch_token_async(client_id: str, client_secret: str, device_code: str
 
 # -------------------- Routes --------------------
 
-
-async def update_commit_status(client: 'GitClient', repo: str, sha: str, state: str, description: str, context: str = "PR Review"):
+async def update_commit_status(client: GitHubClient, repo: str, sha: str, state: str, description: str, context: str = "PR Review"):
     """Update commit status on GitHub"""
     try:
         await client.create_commit_status(
@@ -208,7 +254,7 @@ async def update_commit_status(client: 'GitClient', repo: str, sha: str, state: 
         logger.error(f"Failed to update commit status: {str(e)}")
 
 @app.post("/login")
-async def login(request: LoginRequest):
+async def login(request: LoginRequest, background_tasks: BackgroundTasks):
     """
     Handles the login process for different git providers
     """
@@ -229,7 +275,6 @@ async def login(request: LoginRequest):
                     raise ValueError("Invalid device code response")
                 
                 # Start background token fetch
-                background_tasks = BackgroundTasks()
                 background_tasks.add_task(
                     fetch_token_async,
                     request.client_id,
@@ -248,100 +293,18 @@ async def login(request: LoginRequest):
                     "expires_in": device_info["expires_in"],
                     "interval": device_info["interval"],
                     "message": f"Please visit {device_info['verification_uri']} and enter code: {device_info['user_code']}",
-                    "provider": provider
+                    "provider": provider,
+                    "client_id": request.client_id
                 }
             except Exception as e:
                 logger.error(f"Error in GitHub authentication: {str(e)}")
                 raise HTTPException(status_code=400, detail=str(e))
-                
-        elif provider == "gitlab":
-            # GitLab uses direct token authentication
-            try:
-                # Clean up and validate the token
-                token = request.client_secret.strip()
-                
-                # Validate token format
-                if not token:
-                    raise ValueError("Token cannot be empty")
-                
-                # Validate token format based on type
-                if token.startswith(('glpat-', 'gloas-')):
-                    # Modern token format - validate length
-                    if len(token) < 20:
-                        raise ValueError("GitLab token is too short")
-                else:
-                    # Legacy token format - just check minimum length
-                    if len(token) < 20:
-                        raise ValueError("Invalid GitLab token format")
-
-                # Set up GitLab API URL
-                gitlab_url = request.provider_url or "https://gitlab.com"
-                # Ensure URL doesn't end with a slash
-                gitlab_url = gitlab_url.rstrip('/')
-
-                # Store token with all necessary info
-                access_tokens[request.client_id] = {
-                    "token": token,
-                    "provider": provider,
-                    "provider_url": gitlab_url,
-                    "timestamp": time.time()
-                }
-                
-                # Try to validate token by making a test API call
-                client = GitClientFactory.create_client(
-                    provider=provider,
-                    token=token,
-                    gitlab_url=gitlab_url
-                )
-                await client.get_repositories()  # Test API call
-                
-                return {
-                    "status": "authenticated",
-                    "auth_type": "token",
-                    "provider": provider,
-                    "provider_url": request.provider_url or "https://gitlab.com",
-                    "message": "Successfully authenticated with GitLab"
-                }
-            except Exception as e:
-                logger.error(f"Error in GitLab authentication: {str(e)}")
-                # Remove invalid token
-                access_tokens.pop(request.client_id, None)
-                raise HTTPException(status_code=401, detail="Invalid GitLab token")
-                
-        elif provider == "bitbucket":
-            # Bitbucket uses OAuth 2.0
-            try:
-                # Store token immediately for Bitbucket
-                access_tokens[request.client_id] = {
-                    "token": request.client_secret,  # App password or OAuth token
-                    "provider": provider,
-                    "provider_url": request.provider_url or "https://api.bitbucket.org/2.0",
-                    "timestamp": time.time()
-                }
-                
-                # Validate token by making a test API call
-                client = GitClientFactory.create_client(
-                    provider=provider,
-                    token=request.client_secret
-                )
-                await client.get_repositories()  # Test API call
-                
-                return {
-                    "status": "authenticated",
-                    "auth_type": "oauth",
-                    "provider": provider,
-                    "message": "Successfully authenticated with Bitbucket"
-                }
-            except Exception as e:
-                logger.error(f"Error in Bitbucket authentication: {str(e)}")
-                # Remove invalid token
-                access_tokens.pop(request.client_id, None)
-                raise HTTPException(status_code=401, detail="Invalid Bitbucket token")
+   
         else:
             # Unknown provider
             raise HTTPException(
                 status_code=400,
-                detail=f"Provider '{provider}' not supported. Supported providers are: github, gitlab, bitbucket"
+                detail=f"Provider '{provider}' not supported. Supported providers are: github"
             )
             
     except HTTPException:
@@ -353,27 +316,52 @@ async def login(request: LoginRequest):
             detail=f"Internal server error during login process: {str(e)}"
         )
 
+@app.get("/login/status/{client_id}")
+async def check_login_status(client_id: str):
+    """Check if the access token is available for a given client_id"""
+    logger.info(f"Checking login status for client_id: {client_id}")
+    
+    if client_id in access_tokens:
+        token_info = access_tokens[client_id]
+        return {
+            "status": "authenticated",
+            "provider": token_info.get("provider", "unknown"),
+            "timestamp": token_info.get("timestamp"),
+            "client_id": client_id
+        }
+    else:
+        return {
+            "status": "pending",
+            "message": "Token not yet available",
+            "client_id": client_id
+        }
 
 @app.post("/repos")
-async def get_repos(request: RepoRequest, client_id: str):
-    token = access_tokens.get(client_id)
-    if not token:
-        raise HTTPException(status_code=401, detail="Access token not available yet. Complete login flow.")
+async def get_repos(request: RepoRequest):
+    """Get repositories for the authenticated user"""
+    logger.info(f"Getting repos for client_id: {request.client_id}")
+    logger.info(f"Available tokens: {list(access_tokens.keys())}")
+    
+    token_info = access_tokens.get(request.client_id)
+    if not token_info:
+        raise HTTPException(
+            status_code=401, 
+            detail=f"Access token not available for client_id: {request.client_id}. Please complete login flow first."
+        )
 
     try:
-        token_info = access_tokens.get(client_id, {})
-        client = GitClientFactory.create_client(
-            provider=token_info.get('provider', 'github'),
-            token=token_info['token'],
-            gitlab_url=token_info.get('provider_url')
-        )
+        client = GitHubClient(token_info['token'])
         repos = await client.get_repositories()
         repo_list = []
         
         for repo in repos:
             # Get PRs for each repository
-            prs = client.get_pull_requests(repo.full_name)
-            pr_list = [{"number": pr.number, "title": pr.title, "state": pr.state} for pr in prs]
+            try:
+                prs = await client.get_pull_requests(repo.full_name)
+                pr_list = [{"number": pr.number, "title": pr.title, "state": pr.state} for pr in prs]
+            except Exception as e:
+                logger.warning(f"Error fetching PRs for {repo.full_name}: {str(e)}")
+                pr_list = []
             
             repo_info = {
                 "name": repo.name,
@@ -390,45 +378,54 @@ async def get_repos(request: RepoRequest, client_id: str):
             "total_open_prs": sum(repo["open_pr_count"] for repo in repo_list)
         }
     except Exception as e:
+        logger.error(f"Error getting repos: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
 
 @app.post("/prs")
-async def get_prs(request: RepoRequest, client_id: str):
-    token = access_tokens.get(client_id)
-    if not token:
-        raise HTTPException(status_code=401, detail="Access token not available yet. Complete login flow.")
+async def get_prs(request: RepoRequest):
+    """Get pull requests for a specific repository"""
+    logger.info(f"Getting PRs for client_id: {request.client_id}")
+    logger.info(f"Available tokens: {list(access_tokens.keys())}")
+    
+    if not request.repo_name:
+        raise HTTPException(status_code=400, detail="repo_name is required")
+    
+    token_info = access_tokens.get(request.client_id)
+    if not token_info:
+        raise HTTPException(
+            status_code=401, 
+            detail=f"Access token not available for client_id: {request.client_id}. Please complete login flow first."
+        )
 
     try:
-        token_info = access_tokens.get(client_id, {})
-        client = GitClientFactory.create_client(
-            provider=token_info.get('provider', 'github'),
-            token=token_info['token'],
-            gitlab_url=token_info.get('provider_url')
-        )
+        client = GitHubClient(token_info['token'])
         prs = await client.get_pull_requests(request.repo_name)
-        return {"pull_requests": [{"number": pr.number, "title": pr.title} for pr in prs]}
+        return {"pull_requests": [{"number": pr.number, "title": pr.title, "state": pr.state} for pr in prs]}
     except Exception as e:
+        logger.error(f"Error getting PRs: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
-@app.post("/review")
-async def review_pr(request: PRRequest, client_id: str, background_tasks: BackgroundTasks):
-    print(f"[DEBUG] Received review request for repo={request.repo_name}, PR={request.pr_number}, client_id={client_id}")
 
-    token = access_tokens.get(client_id)
-    if not token:
-        print(f"[ERROR] No access token found for client_id={client_id}")
-        raise HTTPException(status_code=401, detail="Access token not available yet. Complete login flow.")
+@app.post("/review")
+async def review_pr(request: PRRequest, background_tasks: BackgroundTasks):
+    """Review a pull request"""
+    print(f"[DEBUG] Received review request for repo={request.repo_name}, PR={request.pr_number}, client_id={request.client_id}")
+    print(f"[DEBUG] Available tokens: {list(access_tokens.keys())}")
+
+    token_info = access_tokens.get(request.client_id)
+    if not token_info:
+        print(f"[ERROR] No access token found for client_id={request.client_id}")
+        print(f"[ERROR] Available client_ids: {list(access_tokens.keys())}")
+        raise HTTPException(
+            status_code=401, 
+            detail=f"Access token not available for client_id: {request.client_id}. Please complete login flow first."
+        )
 
     try:
-        print("[DEBUG] Initializing Git client...")
-        token_info = access_tokens.get(client_id, {})
-        client = GitClientFactory.create_client(
-            provider=token_info.get('provider', 'github'),
-            token=token_info['token'],
-            gitlab_url=token_info.get('provider_url')
-        )
+        print("[DEBUG] Initializing GitHub client...")
+        client = GitHubClient(token_info['token'])
 
         print("[DEBUG] Fetching PR files...")
-        files = client.get_pr_files(request.repo_name, request.pr_number)
+        files = await client.get_pr_files(request.repo_name, request.pr_number)
         print(f"[DEBUG] Total files fetched from PR: {len(files)}")
 
         # Initialize analyzers
